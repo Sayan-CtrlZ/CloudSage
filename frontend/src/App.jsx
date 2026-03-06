@@ -37,26 +37,96 @@ const PC = { AWS: T.amber, GCP: T.blue, Azure: T.cyan };
 const PI = { AWS: "☁", GCP: "◈", Azure: "◻" };
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-/* ─── PARSE ─────────────────────────────────────────────────────────────────── */
+/* ─── PARSE & NORMALIZE (UNIVERSAL) ────────────────────────────────────────── */
+function fuzzyMatch(str, possible) {
+  const s = String(str || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return possible.some(p => s.includes(p));
+}
+
+function parseUniversalData(rawTxt) {
+  let data = [];
+  try {
+    data = typeof rawTxt === "string" ? (rawTxt.trim().startsWith("[") ? JSON.parse(rawTxt) : parseCSV(rawTxt)) : rawTxt;
+  } catch (e) {
+    return [];
+  }
+
+  return data.map((row, i) => {
+    const keys = Object.keys(row);
+    const getVal = (aliases, fallback) => {
+      const k = keys.find(k => fuzzyMatch(k, aliases));
+      return k ? row[k] : fallback;
+    };
+
+    // Auto-detect fields based on common column names
+    const resource_id = getVal(["id", "name", "resource", "instance"], `unknown-resource-${i}`);
+    const provider = getVal(["provider", "cloud", "vendor", "platform"], "AWS");
+    const type = getVal(["type", "class", "size", "sku", "family"], "standard");
+    const region = getVal(["region", "location", "zone"], "global");
+
+    // Financials & Metrics
+    const costNum = parseFloat(getVal(["cost", "spend", "price", "amount", "total"], 0));
+    const monthly_cost = isNaN(costNum) ? 0 : Math.round(costNum);
+
+    const cpuStr = getVal(["cpu", "compute"], "0");
+    const memStr = getVal(["mem", "ram"], "0");
+    const cpu_avg = parseFloat(cpuStr) || 25; // Default healthy if unknown
+    const mem_avg = parseFloat(memStr) || 25;
+
+    const storageStr = getVal(["storage", "disk", "volume", "gb", "size", "bytes"], "0");
+    const storage_gb = parseFloat(storageStr) || 50;
+
+    const idleStr = getVal(["idle", "unused", "downtime"], "0");
+    let hours_idle = parseFloat(idleStr) || 0;
+
+    // Infer idle if metrics exist but idle is not explicitly provided
+    if (hours_idle === 0 && cpu_avg < 5 && mem_avg < 15) {
+      hours_idle = 600; // Assume highly idle if utilization is rock bottom
+    }
+
+    return {
+      resource_id: String(resource_id),
+      provider: ["AWS", "GCP", "Azure"].find(p => String(provider).toUpperCase().includes(p.toUpperCase())) || "AWS",
+      type: String(type),
+      region: String(region),
+      cpu_avg,
+      mem_avg,
+      storage_gb,
+      monthly_cost,
+      hours_idle,
+      tags: getVal(["tag", "label", "project", "env"], "unassigned")
+    };
+  });
+}
+
 function parseCSV(txt) {
   const lines = txt.trim().split("\n");
   const hdr = lines[0].split(",").map(h => h.trim());
   return lines.slice(1).map(ln => {
-    const v = ln.split(",").map(s => s.trim());
+    const v = ln.split(",").map(s => s.trim().replace(/^"|"$/g, ''));
     const o = {};
-    hdr.forEach((h, i) => { o[h] = isNaN(v[i]) || v[i] === "" ? v[i] : +v[i]; });
+    hdr.forEach((h, i) => { o[h] = v[i]; });
     return o;
   });
 }
 
 /* ─── ML ANALYSIS ENGINE ────────────────────────────────────────────────────── */
 function analyze(resources) {
-  return resources.map(r => {
-    const idleRatio = r.hours_idle / 720;
-    const isIdle = idleRatio > 0.6;
-    const isOver = r.cpu_avg < 15 && r.mem_avg < 20;
-    const isBigStore = r.storage_gb > 400;
-    const noScale = r.cpu_avg < 20 && r.monthly_cost > 300;
+  if (!resources || !resources.length) return [];
+
+  return resources.map((r, i) => {
+    // Normalization safety checks
+    const cost = Math.max(0, r.monthly_cost);
+    const cpu = Math.max(0, r.cpu_avg);
+    const mem = Math.max(0, r.mem_avg);
+    const store = Math.max(0, r.storage_gb);
+    const idle = Math.max(0, r.hours_idle);
+
+    const idleRatio = idle / 720;
+    const isIdle = idleRatio > 0.6 || (cpu < 5 && cost > 50);
+    const isOver = cpu < 15 && mem < 20 && cost > 20;
+    const isBigStore = store > 400;
+    const noScale = cpu < 20 && cost > 300;
 
     let score = 0;
     if (isIdle) score += 4;
@@ -70,34 +140,36 @@ function analyze(resources) {
     const cliCmds = [];
     const terraformFix = [];
 
+    const safeId = String(r.resource_id || `res-${i}`).replace(/[^a-zA-Z0-9_-]/g, "_");
+
     if (isIdle) {
-      savings += r.monthly_cost * 0.9;
+      savings += cost * 0.9;
       actions.push({ icon: "🛑", text: "Terminate or hibernate idle instance", impact: "High" });
-      cliCmds.push(`aws ec2 stop-instances --instance-ids ${r.resource_id}`);
-      terraformFix.push(`# Stop idle instance\nresource "aws_instance" "${r.resource_id.replace(/-/g, "_")}" {\n  instance_state = "stopped"\n}`);
+      cliCmds.push(`aws ec2 stop-instances --instance-ids ${safeId}`);
+      terraformFix.push(`# Stop idle instance\nresource "aws_instance" "${safeId}" {\n  instance_state = "stopped"\n}`);
     } else if (isOver) {
-      savings += r.monthly_cost * 0.45;
+      savings += cost * 0.45;
       actions.push({ icon: "📦", text: "Downsize to next smaller instance type", impact: "High" });
-      cliCmds.push(`aws ec2 modify-instance-attribute --instance-id ${r.resource_id} --instance-type t3.small`);
-      terraformFix.push(`# Downsize instance\nresource "aws_instance" "${r.resource_id.replace(/-/g, "_")}" {\n  instance_type = "t3.small"\n}`);
+      cliCmds.push(`aws ec2 modify-instance-attribute --instance-id ${safeId} --instance-type t3.small`);
+      terraformFix.push(`# Downsize instance\nresource "aws_instance" "${safeId}" {\n  instance_type = "t3.small"\n}`);
     }
     if (isBigStore) {
-      savings += (r.storage_gb - 200) * 0.023;
+      savings += (store - 200) * 0.023;
       actions.push({ icon: "🗄", text: "Archive cold data to Glacier / Coldline", impact: "Medium" });
-      cliCmds.push(`aws s3api put-bucket-lifecycle-configuration --bucket ${r.resource_id}-data --lifecycle-configuration file://lifecycle.json`);
-      terraformFix.push(`# Add lifecycle rule\nresource "aws_s3_bucket_lifecycle_configuration" "${r.resource_id.replace(/-/g, "_")}_lifecycle" {\n  rule { transition { days = 30; storage_class = "GLACIER" } }\n}`);
+      cliCmds.push(`aws s3api put-bucket-lifecycle-configuration --bucket ${safeId}-data --lifecycle-configuration file://lifecycle.json`);
+      terraformFix.push(`# Add lifecycle rule\nresource "aws_s3_bucket_lifecycle_configuration" "${safeId}_lifecycle" {\n  rule { transition { days = 30; storage_class = "GLACIER" } }\n}`);
     }
     if (noScale) {
-      savings += r.monthly_cost * 0.3;
+      savings += cost * 0.3;
       actions.push({ icon: "⚡", text: "Configure autoscaling group (min:1, max:4)", impact: "Medium" });
-      cliCmds.push(`aws autoscaling create-auto-scaling-group --auto-scaling-group-name ${r.resource_id}-asg --min-size 1 --max-size 4`);
-      terraformFix.push(`# Add autoscaling\nresource "aws_autoscaling_group" "${r.resource_id.replace(/-/g, "_")}_asg" {\n  min_size = 1\n  max_size = 4\n  desired_capacity = 2\n}`);
+      cliCmds.push(`aws autoscaling create-auto-scaling-group --auto-scaling-group-name ${safeId}-asg --min-size 1 --max-size 4`);
+      terraformFix.push(`# Add autoscaling\nresource "aws_autoscaling_group" "${safeId}_asg" {\n  min_size = 1\n  max_size = 4\n  desired_capacity = 2\n}`);
     }
     if (actions.length === 0) {
       actions.push({ icon: "✅", text: "Well-optimized — schedule monthly review", impact: "Low" });
     }
 
-    const co2 = Math.round((r.hours_idle / 720) * Math.max(savings, 1) * 0.015 * 10) / 10;
+    const co2 = Math.round((idle / 720) * Math.max(savings, 1) * 0.015 * 10) / 10;
 
     return { ...r, risk, score, savings: Math.round(savings), actions, cliCmds, terraformFix, co2, isIdle, isOver, isBigStore, noScale };
   });
@@ -251,8 +323,8 @@ export default function App() {
     setTimeout(step, 150);
   }, []);
 
-  const loadFile = useCallback((txt, isJson) => {
-    try { runScan(isJson ? JSON.parse(txt) : parseCSV(txt)); }
+  const loadFile = useCallback((txt) => {
+    try { runScan(parseUniversalData(txt)); }
     catch (e) { alert("Parse error: " + e.message); }
   }, [runScan]);
 
@@ -261,14 +333,14 @@ export default function App() {
     const f = e.dataTransfer.files[0];
     if (!f) return;
     const r = new FileReader();
-    r.onload = ev => loadFile(ev.target.result, f.name.endsWith(".json"));
+    r.onload = ev => loadFile(ev.target.result);
     r.readAsText(f);
   };
   const handlePick = (e) => {
     const f = e.target.files[0];
     if (!f) return;
     const r = new FileReader();
-    r.onload = ev => loadFile(ev.target.result, f.name.endsWith(".json"));
+    r.onload = ev => loadFile(ev.target.result);
     r.readAsText(f);
   };
 
