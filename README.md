@@ -114,6 +114,16 @@ The application will now safely boot up locally! Navigate your browser to `http:
 
 ---
 
+## 🚀 Deployment (Vercel)
+This app is fully optimized for **zero-config deployment on Vercel**. 
+Because it includes a `vercel.json` file, Vercel understands how to automatically build the Vite React app and configure the Express server via Serverless functions automatically.
+
+1. Create a new project on Vercel and import this repository.
+2. Vercel will automatically read `vercel.json` and build the UI correctly while routing all `/api/*` traffic to the backend API.
+3. Add `GEMINI_API_KEY` to your Vercel Project Environment Variables.
+
+---
+
 ## 🤝 Contributing
 Contributions are always welcome! If you'd like to improve the UI logic, add additional charts, refine prompt injection engineering on the backend API, or simply resolve a bug, feel free to open a Pull Request.
 

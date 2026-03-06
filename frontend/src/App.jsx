@@ -462,7 +462,7 @@ export default function App() {
               }}>with AI Precision</span>
             </h1>
             <p style={{ color: T.muted, fontSize: 15, lineHeight: 1.7, maxWidth: 460, margin: "0 auto" }}>
-              Upload cloud usage data. NimbusIQ's ML engine detects waste, forecasts spend,
+              Upload cloud usage data. CloudSage's ML engine detects waste, forecasts spend,
               and generates copy-paste remediation scripts instantly.
             </p>
           </div>
@@ -1380,8 +1380,8 @@ const Logo = () => (
       background: `linear-gradient(135deg,${T.cyan},${T.blue})`,
       display: "flex", alignItems: "center", justifyContent: "center",
       fontSize: 14, fontWeight: 900, color: T.bg, fontFamily: T.mono
-    }}>N</div>
-    <span style={{ fontSize: 15, fontWeight: 900, fontFamily: T.display, letterSpacing: "-0.02em" }}>NimbusIQ</span>
+    }}>C</div>
+    <span style={{ fontSize: 15, fontWeight: 900, fontFamily: T.display, letterSpacing: "-0.02em" }}>CloudSage</span>
   </div>
 );
 const Pill = ({ color, children }) => (
